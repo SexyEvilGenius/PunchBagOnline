@@ -4,6 +4,17 @@
 #include "Components/ActorComponent.h"
 #include "MotionInterpolatorComponent.generated.h"
 
+UENUM()
+enum class EMotionSnapshotFlags : uint8
+{
+	None				= 0x0,
+	HasVelocity			= 0x1,
+	HasAngularVelocity	= 0x2,
+
+	FLAGS_COUNT			= 0x2
+};
+ENUM_CLASS_FLAGS(EMotionSnapshotFlags)
+
 USTRUCT(BlueprintType)
 struct FMotionSnapshot
 {
@@ -11,7 +22,9 @@ struct FMotionSnapshot
 
 public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotionInterpolator")
-	FTransform Transform;
+	FVector Location;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotionInterpolator")
+	FQuat Rotation;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotionInterpolator")
 	FVector Velocity;
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotionInterpolator")
@@ -19,19 +32,56 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MotionInterpolator")
 	float Timestamp;
 
-	FMotionSnapshot(FTransform newTransform, FVector newVelocity, FVector newAngularVelocity, float newTimestamp) :
-		Transform(newTransform),
-		Velocity(newVelocity),
-		AngularVelocity(newAngularVelocity),
-		Timestamp(newTimestamp)
+	FMotionSnapshot(FVector InLocation, FQuat InRotation, FVector InVelocity, FVector InAngularVelocity, float InTimestamp) :
+		Location(InLocation),
+		Rotation(InRotation),
+		Velocity(InVelocity),
+		AngularVelocity(InAngularVelocity),
+		Timestamp(InTimestamp)
 	{}
 
 	FMotionSnapshot() :
-		Transform(),
+		Location(),
+		Rotation(),
 		Velocity(),
 		AngularVelocity(),
 		Timestamp()
 	{}
+
+	FMotionSnapshot(const USceneComponent& InComponent, float InTimestamp) :
+		Location(InComponent.GetComponentLocation()),
+		Rotation(InComponent.GetComponentRotation()),
+		Velocity(InComponent.GetComponentVelocity()),
+		Timestamp(InTimestamp)
+	{
+		const UPrimitiveComponent* asPrimitiveComponent = Cast<const UPrimitiveComponent>(&InComponent);
+		if (IsValid(asPrimitiveComponent))
+		{
+			AngularVelocity = asPrimitiveComponent->GetPhysicsAngularVelocityInDegrees();
+		}
+	}
+
+	void ApplyTo(USceneComponent& InComponent)
+	{
+		InComponent.SetWorldLocationAndRotation(Location, Rotation);
+		UPrimitiveComponent* asPrimitiveComponent = Cast<UPrimitiveComponent>(&InComponent);
+		if (IsValid(asPrimitiveComponent))
+		{
+			asPrimitiveComponent->SetPhysicsLinearVelocity(Velocity);
+			asPrimitiveComponent->SetPhysicsAngularVelocityInDegrees(AngularVelocity);
+		}
+	}
+
+	bool NetSerialize(FArchive& Ar, class UPackageMap* Map, bool& bOutSuccess);
+};
+
+template<>
+struct TStructOpsTypeTraits<FMotionSnapshot> : public TStructOpsTypeTraitsBase2<FMotionSnapshot>
+{
+	enum
+	{
+		WithNetSerializer = true
+	};
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMotionInterpolatorDelegate, const FMotionSnapshot&, Snapshot);
@@ -55,12 +105,9 @@ public:
 	void GetSnapshotAtTime(float TargetTime, bool CanExtrapolate, FMotionSnapshot& Result, int& OffBorder);
 
 	UFUNCTION(Server, unreliable)
-	void ServerSendSnapshot(const FMotionSnapshot& InSnapshot, ENetRole SenderRole);
+	void ServerSendSnapshot(const FMotionSnapshot& InSnapshot, FGuid SenderGuid);
 	UFUNCTION(NetMulticast, unreliable)
-	void MulticastSendSnapshot(const FMotionSnapshot& InSnapshot, ENetRole SenderRole);
-
-	UFUNCTION(BlueprintCallable, Category = "MotionInterpolator")
-	void ResetToNewestPredictedPose();
+	void MulticastSendSnapshot(const FMotionSnapshot& InSnapshot, FGuid SenderGuid);
 
 	UFUNCTION(BlueprintPure, Category = "MotionInterpolator")
 	TArray<FMotionSnapshot> GetSnapshots() { return Snapshots; }
@@ -99,6 +146,7 @@ private:
 	class USceneComponent* ComponentToSync;
 	class USceneComponent* ComponentOverride;
 	TArray<FMotionSnapshot> Snapshots;
+	FGuid GUID = FGuid::NewGuid();
 	float AuthorityReleaseTime = 0.0f;
 	float AuthorityBlendOutFinishTime = 0.0f;
 	float AuthorityBlendOutDuration = 0.0f;

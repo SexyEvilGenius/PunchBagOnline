@@ -3,10 +3,51 @@
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerState.h"
 #include "Kismet/GameplayStatics.h"
+#include "Math/UnrealMath.h"
+
+bool FMotionSnapshot::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
+{
+	// pack bitfield with flags
+	EMotionSnapshotFlags flags = EMotionSnapshotFlags::None;
+	if (!Velocity.IsZero())
+	{
+		flags |= EMotionSnapshotFlags::HasVelocity;
+	}
+	if (!AngularVelocity.IsZero())
+	{
+		flags |= EMotionSnapshotFlags::HasAngularVelocity;
+	}
+	uint8 bits = static_cast<uint8>(flags);
+	Ar.SerializeBits(&(bits), static_cast<uint8>(EMotionSnapshotFlags::FLAGS_COUNT));
+	flags = static_cast<EMotionSnapshotFlags>(bits);
+
+	bOutSuccess = true;
+	bool bOutSuccessLocal = true;
+
+	// update location, rotation, linear velocity
+	bOutSuccess &= SerializePackedVector<10, 27>(Location, Ar);
+
+	Rotation.NetSerialize(Ar, Map, bOutSuccessLocal);
+	bOutSuccess &= bOutSuccessLocal;
+
+	if (EnumHasAnyFlags(flags, EMotionSnapshotFlags::HasVelocity))
+	{
+		bOutSuccess &= SerializePackedVector<10, 27>(Velocity, Ar);
+	}
+	if (EnumHasAnyFlags(flags, EMotionSnapshotFlags::HasAngularVelocity))
+	{
+		bOutSuccess &= SerializePackedVector<10, 27>(AngularVelocity, Ar);
+	}
+
+	Ar << Timestamp;
+
+	return true;
+}
 
 UMotionInterpolatorComponent::UMotionInterpolatorComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
+	bAutoActivate = true;
 	SetIsReplicatedByDefault(true);
 }
 
@@ -14,16 +55,9 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 	
-	UWorld* World = GetWorld();
-	const float currentSyncedTime = World->GetGameState()->GetServerWorldTimeSeconds();
-	const AActor* Owner = GetOwner();
-	AController* InstigatorController = IsValid(Owner) ? Owner->GetInstigatorController() : nullptr;
-	APlayerController* LocalPlayerController = World->GetNetMode()==NM_DedicatedServer ? nullptr : UGameplayStatics::GetPlayerController(GetWorld(), 0);
+	const float currentSyncedTime = GetWorld()->GetGameState()->GetServerWorldTimeSeconds();
 
-	ENetRole OwnerRole = IsValid(Owner) ? Owner->GetLocalRole() : ROLE_None;
-	ENetRole OwnerRemoteRole = IsValid(Owner) ? Owner->GetRemoteRole() : ROLE_None;
 	USceneComponent* component = GetComponentToSync();
-	UPrimitiveComponent* physComponent = Cast<UPrimitiveComponent>(component);
 
 	if (IsValid(component))
 	{
@@ -34,9 +68,10 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 		}
 		else
 		{
+			const AActor* Owner = GetOwner();
 			if (IsValid(Owner))
 			{
-				hasMovementAuthority = OwnerRole == ROLE_Authority ? !Owner->HasNetOwner() || Owner->HasLocalNetOwner() : Owner->HasLocalNetOwner();
+				hasMovementAuthority = GetOwnerRole() == ROLE_Authority ? !Owner->HasNetOwner() || Owner->HasLocalNetOwner() : Owner->HasLocalNetOwner();
 			}
 		}
 		if (hasMovementAuthority)
@@ -44,48 +79,19 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 			Snapshots.Empty();
 			if ((SyncPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSyncTime) > SyncPeriod))
 			{
-				FMotionSnapshot Snapshot;
-				Snapshot.Timestamp = currentSyncedTime;
-				Snapshot.Transform = component->GetComponentTransform();
-				Snapshot.Velocity = component->GetComponentVelocity();
-				if (IsValid(physComponent))
-				{
-					Snapshot.AngularVelocity = physComponent->GetPhysicsAngularVelocityInRadians();
-				}
-
-				ServerSendSnapshot(Snapshot, OwnerRole);
+				ServerSendSnapshot(FMotionSnapshot(*component, currentSyncedTime), GUID);
 				LastSyncTime = currentSyncedTime;
 			}
 		}
-		else if (!IsValid(physComponent) || SnapPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSnapTime) > SnapPeriod)
+		else if (SnapPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSnapTime) > SnapPeriod)
 		{
 			FMotionSnapshot Snapshot;
 			int OffBorder = 0;
 			GetSnapshotAtTime(currentSyncedTime - NetworkDelay, UseExtrapolation, Snapshot, OffBorder);
-			const float blendOutTime = AuthorityBlendOutFinishTime - currentSyncedTime;
 
 			if (OffBorder == 0)
 			{
-				if (blendOutTime > 0.0f)
-				{
-					const float alpha = 1.0f - (blendOutTime / AuthorityBlendOutDuration);
-					FMotionSnapshot NewSnapshot;
-					NewSnapshot.Timestamp = currentSyncedTime;
-					NewSnapshot.Transform = component->GetComponentTransform();
-					NewSnapshot.Velocity = component->GetComponentVelocity();
-					if (IsValid(physComponent))
-					{
-						NewSnapshot.AngularVelocity = physComponent->GetPhysicsAngularVelocityInRadians();
-					}
-					Snapshot = SimpleInterpolate(NewSnapshot, Snapshot, alpha);
-				}
-
-				component->SetWorldTransform(Snapshot.Transform);
-				if (IsValid(physComponent))
-				{
-					physComponent->SetPhysicsLinearVelocity(Snapshot.Velocity);
-					physComponent->SetPhysicsAngularVelocityInRadians(Snapshot.AngularVelocity);
-				}
+				Snapshot.ApplyTo(*component);
 				LastSnapTime = currentSyncedTime;
 			}
 		}
@@ -156,84 +162,60 @@ void UMotionInterpolatorComponent::GetSnapshotAtTime(float TargetTime, bool CanE
 	}
 }
 
-void UMotionInterpolatorComponent::ServerSendSnapshot_Implementation(const FMotionSnapshot& InSnapshot, ENetRole SenderRole)
+void UMotionInterpolatorComponent::ServerSendSnapshot_Implementation(const FMotionSnapshot& InSnapshot, FGuid SenderGuid)
 {
-	MulticastSendSnapshot(InSnapshot, SenderRole);
+	MulticastSendSnapshot(InSnapshot, SenderGuid);
 }
 
-void UMotionInterpolatorComponent::MulticastSendSnapshot_Implementation(const FMotionSnapshot& InSnapshot, ENetRole SenderRole)
+void UMotionInterpolatorComponent::MulticastSendSnapshot_Implementation(const FMotionSnapshot& InSnapshot, FGuid SenderGuid)
 {
-	if (SenderRole != GetOwnerRole())
+	if (SenderGuid != GUID)
 	{
 		AddSnapshot(InSnapshot);
 	}
 }
 
-void UMotionInterpolatorComponent::ResetToNewestPredictedPose()
-{
-	USceneComponent* component = GetComponentToSync();
-	UPrimitiveComponent* physComponent = Cast<UPrimitiveComponent>(component);
-	const float currentSyncedTime = GetWorld()->GetGameState()->GetServerWorldTimeSeconds();
-
-	FMotionSnapshot Snapshot;
-	int OffBorder = 0;
-	GetSnapshotAtTime(currentSyncedTime+NetworkDelay, true, Snapshot, OffBorder);
-	component->SetWorldTransform(Snapshot.Transform);
-	if (IsValid(physComponent))
-	{
-		physComponent->SetPhysicsLinearVelocity(Snapshot.Velocity);
-		physComponent->SetPhysicsAngularVelocityInRadians(Snapshot.AngularVelocity);
-	}
-}
-
 void UMotionInterpolatorComponent::OvertakeMovementAuthority(float Duration, float BlendOutDuration)
 {
-	UWorld* World = GetWorld();
-	AuthorityReleaseTime = World->GetGameState()->GetServerWorldTimeSeconds() + Duration;
-	AuthorityBlendOutDuration = BlendOutDuration;
-	AuthorityBlendOutFinishTime = World->GetGameState()->GetServerWorldTimeSeconds() + Duration + AuthorityBlendOutDuration;
+	AuthorityReleaseTime = GetWorld()->GetGameState()->GetServerWorldTimeSeconds() + Duration;
 }
 
 FMotionSnapshot UMotionInterpolatorComponent::Interpolate(const FMotionSnapshot& FirstSnapshot, const FMotionSnapshot& SecondSnapshot, float TargetTime)
 {
+	FMotionSnapshot Result;
+
 	float Alpha = UKismetMathLibrary::NormalizeToRange(TargetTime, FirstSnapshot.Timestamp, SecondSnapshot.Timestamp);
 
 	float PredictionTime = TargetTime - FirstSnapshot.Timestamp;
 	float ReversePredictionTime = SecondSnapshot.Timestamp - TargetTime;
 
-	FVector ForwardPrediction = FirstSnapshot.Transform.GetLocation() + (FirstSnapshot.Velocity * PredictionTime);
-	FVector BackwardPrediction = SecondSnapshot.Transform.GetLocation() + (FirstSnapshot.Velocity * ReversePredictionTime * -1);
+	// Location of the object predicted from what we knew before
+	FVector ForwardPrediction = FirstSnapshot.Location + (FirstSnapshot.Velocity * PredictionTime);
+	// Location of the object calculated from what we know now
+	FVector BackwardPrediction = SecondSnapshot.Location + (SecondSnapshot.Velocity * ReversePredictionTime * -1);
 
-	FMotionSnapshot Result;
-	Result.Transform.SetLocation(FMath::Lerp(ForwardPrediction, BackwardPrediction, Alpha));
-	Result.Transform.SetRotation(FMath::Lerp(FirstSnapshot.Transform.GetRotation(), SecondSnapshot.Transform.GetRotation(), FMath::InterpSinInOut<float>(0.f, 1.f, Alpha)));
-	Result.Transform.SetScale3D(FMath::Lerp(FirstSnapshot.Transform.GetScale3D(), SecondSnapshot.Transform.GetScale3D(), Alpha));
+	Result.Location = FMath::Lerp(ForwardPrediction, BackwardPrediction, Alpha);
+
+	// Non-linear interpolation for rotation. No backward prediction required.
+	Result.Rotation = FMath::Lerp(FirstSnapshot.Rotation, SecondSnapshot.Rotation, FMath::InterpSinInOut<float>(0.f, 1.f, Alpha));
+
 	Result.Velocity = FMath::Lerp(FirstSnapshot.Velocity, SecondSnapshot.Velocity, Alpha);
 	Result.AngularVelocity = FMath::Lerp(FirstSnapshot.AngularVelocity, SecondSnapshot.AngularVelocity, Alpha);
+
 	Result.Timestamp = TargetTime;
-	return Result;
-}
 
-FMotionSnapshot UMotionInterpolatorComponent::SimpleInterpolate(const FMotionSnapshot& FirstSnapshot, const FMotionSnapshot& SecondSnapshot, float Alpha)
-{
-	FMotionSnapshot Result;
-	Result.Transform.SetLocation(FMath::Lerp(FirstSnapshot.Transform.GetLocation(), SecondSnapshot.Transform.GetLocation(), Alpha));
-	Result.Transform.SetRotation(FMath::Lerp(FirstSnapshot.Transform.GetRotation(), SecondSnapshot.Transform.GetRotation(), FMath::InterpSinInOut<float>(0.f, 1.f, Alpha)));
-	Result.Transform.SetScale3D(FMath::Lerp(FirstSnapshot.Transform.GetScale3D(), SecondSnapshot.Transform.GetScale3D(), Alpha));
-	Result.Velocity = FMath::Lerp(FirstSnapshot.Velocity, SecondSnapshot.Velocity, Alpha);
-	Result.AngularVelocity = FMath::Lerp(FirstSnapshot.AngularVelocity, SecondSnapshot.AngularVelocity, Alpha);
-	Result.Timestamp = FMath::Lerp(FirstSnapshot.Timestamp, SecondSnapshot.Timestamp, Alpha);
 	return Result;
 }
 
 FMotionSnapshot UMotionInterpolatorComponent::Extrapolate(const FMotionSnapshot& Snapshot, float TargetTime)
 {
+	FMotionSnapshot Result = Snapshot;
+
 	float PredictionTime = TargetTime - Snapshot.Timestamp;
 
-	FVector ForwardPrediction = Snapshot.Transform.GetLocation() + (Snapshot.Velocity * PredictionTime);
+	Result.Location = Snapshot.Location + (Snapshot.Velocity * PredictionTime);
+	Result.Rotation = (FRotator::MakeFromEuler(Snapshot.AngularVelocity) * PredictionTime).Quaternion() * Snapshot.Rotation;
 
-	FMotionSnapshot Result = Snapshot;
-	Result.Transform.SetLocation(ForwardPrediction);
 	Result.Timestamp = TargetTime;
 	return Result;
 }
