@@ -5,6 +5,40 @@
 #include "Kismet/GameplayStatics.h"
 #include "Math/UnrealMath.h"
 
+FMotionSnapshot::FMotionSnapshot(const USceneComponent& InComponent, float InTimestamp) :
+	Location(InComponent.GetComponentLocation()),
+	Rotation(InComponent.GetComponentRotation()),
+	Velocity(InComponent.GetComponentVelocity()),
+	Timestamp(InTimestamp)
+{
+	const UPrimitiveComponent* asPrimitiveComponent = Cast<const UPrimitiveComponent>(&InComponent);
+	if (IsValid(asPrimitiveComponent))
+	{
+		AngularVelocity = asPrimitiveComponent->GetPhysicsAngularVelocityInDegrees();
+	}
+}
+
+FMotionSnapshot::FMotionSnapshot(const USceneComponent& InComponent) :
+	FMotionSnapshot(InComponent, 0.0f)
+{
+	const UWorld* World = InComponent.GetWorld();
+	if (IsValid(World))
+	{
+		Timestamp = World->GetGameState()->GetServerWorldTimeSeconds();
+	}
+}
+
+void FMotionSnapshot::ApplyTo(USceneComponent& InComponent)
+{
+	InComponent.SetWorldLocationAndRotation(Location, Rotation, false, nullptr, ETeleportType::TeleportPhysics);
+	UPrimitiveComponent* asPrimitiveComponent = Cast<UPrimitiveComponent>(&InComponent);
+	if (IsValid(asPrimitiveComponent))
+	{
+		asPrimitiveComponent->SetPhysicsLinearVelocity(Velocity);
+		asPrimitiveComponent->SetPhysicsAngularVelocityInDegrees(AngularVelocity);
+	}
+}
+
 bool FMotionSnapshot::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
 {
 	// pack bitfield with flags
@@ -22,13 +56,11 @@ bool FMotionSnapshot::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuc
 	flags = static_cast<EMotionSnapshotFlags>(bits);
 
 	bOutSuccess = true;
-	bool bOutSuccessLocal = true;
 
 	// update location, rotation, linear velocity
 	bOutSuccess &= SerializePackedVector<10, 27>(Location, Ar);
 
-	Rotation.NetSerialize(Ar, Map, bOutSuccessLocal);
-	bOutSuccess &= bOutSuccessLocal;
+	Rotation.SerializeCompressedShort(Ar);
 
 	if (EnumHasAnyFlags(flags, EMotionSnapshotFlags::HasVelocity))
 	{
@@ -41,12 +73,22 @@ bool FMotionSnapshot::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuc
 
 	Ar << Timestamp;
 
+	if (Ar.IsLoading())
+	{
+		const UWorld* World = Map->GetWorld();
+		if (IsValid(World) && IsValid(World->GetGameState()))
+		{
+			ArrivalTime = World->GetGameState()->GetServerWorldTimeSeconds();
+		}
+	}
+
 	return true;
 }
 
 UMotionInterpolatorComponent::UMotionInterpolatorComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.TickGroup = TG_PostPhysics;
 	bAutoActivate = true;
 	SetIsReplicatedByDefault(true);
 }
@@ -55,7 +97,7 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 	
-	const float currentSyncedTime = GetWorld()->GetGameState()->GetServerWorldTimeSeconds();
+	const float currentSyncedTime = GetGameState()->GetServerWorldTimeSeconds();
 
 	USceneComponent* component = GetComponentToSync();
 
@@ -74,10 +116,29 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 				hasMovementAuthority = GetOwnerRole() == ROLE_Authority ? !Owner->HasNetOwner() || Owner->HasLocalNetOwner() : Owner->HasLocalNetOwner();
 			}
 		}
+
+		if (HadMovementAuthority != hasMovementAuthority)
+		{
+			if (!HadMovementAuthority)
+			{
+				Snapshots.Empty();
+			}
+			else
+			{
+				CurrentAuthorityBlendTime = AuthorityBlendTime;
+			}
+			HadMovementAuthority = hasMovementAuthority;
+		}
+
 		if (hasMovementAuthority)
 		{
-			Snapshots.Empty();
-			if ((SyncPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSyncTime) > SyncPeriod))
+			float syncPeriod = SyncPeriod;
+			if (CurrentHightFreqSyncDuration > KINDA_SMALL_NUMBER)
+			{
+				CurrentHightFreqSyncDuration -= DeltaTime;
+				syncPeriod = HighFreqSyncPeriod;
+			}
+			if ((syncPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSyncTime) > syncPeriod))
 			{
 				ServerSendSnapshot(FMotionSnapshot(*component, currentSyncedTime), GUID);
 				LastSyncTime = currentSyncedTime;
@@ -87,13 +148,45 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 		{
 			FMotionSnapshot Snapshot;
 			int OffBorder = 0;
-			GetSnapshotAtTime(currentSyncedTime - NetworkDelay, UseExtrapolation, Snapshot, OffBorder);
+			GetSnapshotAtTime(GetLookupTime(), UseExtrapolation, Snapshot, OffBorder);
 
 			if (OffBorder == 0)
 			{
+				if (CurrentAuthorityBlendTime > KINDA_SMALL_NUMBER)
+				{
+					CurrentAuthorityBlendTime -= DeltaTime;
+					const float Alpha = 1 - (CurrentAuthorityBlendTime / AuthorityBlendTime);
+					Snapshot = SimpleInterpolate(FMotionSnapshot(*component), Snapshot, Alpha);
+					Snapshot.Velocity = FVector::ZeroVector;
+					Snapshot.AngularVelocity = FVector::ZeroVector;
+				}
 				Snapshot.ApplyTo(*component);
 				LastSnapTime = currentSyncedTime;
 			}
+		}
+	}
+
+	if (!bUseFixedNetworkDelay)
+	{
+		NetworkDelay = FMath::FInterpTo(NetworkDelay, TargetNetworkDelay, DeltaTime, NetworkDelayInterpolationSpeed);
+	}
+
+	if (GetOwnerRole() == ROLE_Authority && CurrentOwnershipDuration > KINDA_SMALL_NUMBER)
+	{
+		CurrentOwnershipDuration -= DeltaTime;
+		if (CurrentOwnershipDuration < KINDA_SMALL_NUMBER)
+		{
+			ClientReleaseOwnership();
+		}
+	}
+
+	if (CurrentAdditionalNetworkDelay != TargetAdditionalNetworkDelay)
+	{
+		CurrentAdditionalNetworkDelay = FMath::FInterpTo(CurrentAdditionalNetworkDelay, TargetAdditionalNetworkDelay, DeltaTime, NetworkDelayInterpolationSpeed);
+		if (CurrentAdditionalNetworkDelay == TargetAdditionalNetworkDelay)
+		{
+			OnAdditionalDelayReached.ExecuteIfBound();
+			OnAdditionalDelayReached.Unbind();
 		}
 	}
 }
@@ -172,10 +265,74 @@ void UMotionInterpolatorComponent::MulticastSendSnapshot_Implementation(const FM
 	if (SenderGuid != GUID)
 	{
 		AddSnapshot(InSnapshot);
+		if (!bUseFixedNetworkDelay)
+		{
+			const float maxDelay = GetSnapshotsMaxDelay();
+			if (maxDelay > KINDA_SMALL_NUMBER)
+			{
+				TargetNetworkDelay = (maxDelay+0.01) * 1.1f;
+			}
+		}
 	}
 }
 
-void UMotionInterpolatorComponent::OvertakeMovementAuthority(float Duration, float BlendOutDuration)
+void UMotionInterpolatorComponent::ClientSendSnapshot_Implementation(const FMotionSnapshot& InSnapshot)
+{
+	AddSnapshot(InSnapshot);
+}
+
+void UMotionInterpolatorComponent::ServerTakeOwnership_Implementation(AActor* newOwner, float OwnershipDuration)
+{
+	ensureMsgf(GetOwnerRole() == ENetRole::ROLE_Authority, TEXT("'%s' calls ServerTakeOwnership on client! This will have no effect."), *GetName());
+	AActor* componentOwner = GetOwner();
+	if (IsValid(componentOwner) && (!componentOwner->HasNetOwner() || newOwner != componentOwner->GetOwner()))
+	{
+		componentOwner->SetOwner(newOwner);
+		CurrentOwnershipDuration = OwnershipDuration;
+	}
+}
+
+void UMotionInterpolatorComponent::ServerReleaseOwnership_Implementation(const FMotionSnapshot& InSnapshot, float ClientNetworkDelay)
+{
+	TargetAdditionalNetworkDelay = -(NetworkDelay + ClientNetworkDelay);
+	OnAdditionalDelayReached.ExecuteIfBound();
+	OnAdditionalDelayReached.Unbind();
+
+	OnAdditionalDelayReached.BindLambda([this]() {
+		AActor* componentOwner = GetOwner();
+		if (IsValid(componentOwner))
+		{
+			componentOwner->SetOwner(nullptr);
+		}
+		TargetAdditionalNetworkDelay = 0.0f;
+		EnableTempHighFreqUpdate();
+	});
+}
+
+void UMotionInterpolatorComponent::EnableTempHighFreqUpdate()
+{
+	CurrentHightFreqSyncDuration = HighFreqSyncDuration;
+}
+
+void UMotionInterpolatorComponent::ClientReleaseOwnership_Implementation()
+{
+	const FMotionSnapshot& latestSnapshot = FMotionSnapshot(*GetComponentToSync());
+	ServerReleaseOwnership(latestSnapshot, NetworkDelay);
+	EnableTempHighFreqUpdate();
+	//TargetAdditionalNetworkDelay = NetworkDelay;
+}
+
+float UMotionInterpolatorComponent::GetLookupTime()
+{
+	const AGameStateBase* gameState = GetGameState();
+	if (IsValid(gameState))
+	{
+		return gameState->GetServerWorldTimeSeconds() - GetLookupTimeOffset();
+	}
+	return 0.0f;
+}
+
+void UMotionInterpolatorComponent::OvertakeMovementAuthority(float Duration)
 {
 	AuthorityReleaseTime = GetWorld()->GetGameState()->GetServerWorldTimeSeconds() + Duration;
 }
@@ -207,6 +364,17 @@ FMotionSnapshot UMotionInterpolatorComponent::Interpolate(const FMotionSnapshot&
 	return Result;
 }
 
+FMotionSnapshot UMotionInterpolatorComponent::SimpleInterpolate(const FMotionSnapshot& FirstSnapshot, const FMotionSnapshot& SecondSnapshot, float Alpha)
+{
+	FMotionSnapshot Result;
+	Result.Location =FMath::Lerp(FirstSnapshot.Location, SecondSnapshot.Location, Alpha);
+	Result.Rotation =FMath::Lerp(FirstSnapshot.Rotation, SecondSnapshot.Rotation, FMath::InterpSinInOut<float>(0.f, 1.f, Alpha));
+	Result.Velocity = FMath::Lerp(FirstSnapshot.Velocity, SecondSnapshot.Velocity, Alpha);
+	Result.AngularVelocity = FMath::Lerp(FirstSnapshot.AngularVelocity, SecondSnapshot.AngularVelocity, Alpha);
+	Result.Timestamp = FMath::Lerp(FirstSnapshot.Timestamp, SecondSnapshot.Timestamp, Alpha);
+	return Result;
+}
+
 FMotionSnapshot UMotionInterpolatorComponent::Extrapolate(const FMotionSnapshot& Snapshot, float TargetTime)
 {
 	FMotionSnapshot Result = Snapshot;
@@ -214,7 +382,7 @@ FMotionSnapshot UMotionInterpolatorComponent::Extrapolate(const FMotionSnapshot&
 	float PredictionTime = TargetTime - Snapshot.Timestamp;
 
 	Result.Location = Snapshot.Location + (Snapshot.Velocity * PredictionTime);
-	Result.Rotation = (FRotator::MakeFromEuler(Snapshot.AngularVelocity) * PredictionTime).Quaternion() * Snapshot.Rotation;
+	Result.Rotation = Snapshot.Rotation + FRotator::MakeFromEuler(Snapshot.AngularVelocity * PredictionTime);
 
 	Result.Timestamp = TargetTime;
 	return Result;
@@ -255,4 +423,37 @@ USceneComponent* UMotionInterpolatorComponent::GetComponentToSync()
 		}
 	}
 	return ComponentToSync;
+}
+
+float UMotionInterpolatorComponent::GetSnapshotsMaxDelay()
+{
+	float MaxDelay = 0.0f;
+	if (Snapshots.Num() != 0)
+	{
+		for (int32 i = 0; i < Snapshots.Num(); ++i)
+		{
+			const FMotionSnapshot& Snapshot = Snapshots[i];
+			const float Delay = Snapshot.ArrivalTime - Snapshot.Timestamp;
+			MaxDelay = FMath::Max(Delay, MaxDelay);
+		}
+	}
+	return MaxDelay;
+}
+
+float UMotionInterpolatorComponent::GetLookupTimeOffset()
+{
+	return NetworkDelay + CurrentAdditionalNetworkDelay;
+}
+
+const AGameStateBase* UMotionInterpolatorComponent::GetGameState()
+{
+	if (!IsValid(CachedGameState))
+	{
+		const UWorld* World = GetWorld();
+		if (IsValid(World) && IsValid(World->GetGameState()))
+		{
+			CachedGameState = World->GetGameState();
+		}
+	}
+	return CachedGameState;
 }
