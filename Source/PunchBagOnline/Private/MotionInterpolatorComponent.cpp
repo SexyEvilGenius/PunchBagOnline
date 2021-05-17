@@ -163,6 +163,10 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 				Snapshot.ApplyTo(*component);
 				LastSnapTime = currentSyncedTime;
 			}
+			else
+			{
+				OnNotEnoughData.Broadcast();
+			}
 		}
 	}
 
@@ -267,11 +271,14 @@ void UMotionInterpolatorComponent::MulticastSendSnapshot_Implementation(const FM
 		AddSnapshot(InSnapshot);
 		if (!bUseFixedNetworkDelay)
 		{
-			const float maxDelay = GetSnapshotsMaxDelay();
-			if (maxDelay > KINDA_SMALL_NUMBER)
+			float TimeSinceLastSnapshot = 0.0f;
+			const AGameStateBase* gameState = GetGameState();
+			if (IsValid(gameState) && Snapshots.Num() > 1)
 			{
-				TargetNetworkDelay = (maxDelay+0.01) * 1.1f;
+				TimeSinceLastSnapshot = gameState->GetServerWorldTimeSeconds() - Snapshots[Snapshots.Num()-2].ArrivalTime;
 			}
+			const float maxDelay = GetSnapshotsMaxDelay();
+			TargetNetworkDelay = (maxDelay+TimeSinceLastSnapshot)*1.5;
 		}
 	}
 }
@@ -428,9 +435,9 @@ USceneComponent* UMotionInterpolatorComponent::GetComponentToSync()
 float UMotionInterpolatorComponent::GetSnapshotsMaxDelay()
 {
 	float MaxDelay = 0.0f;
-	if (Snapshots.Num() != 0)
+	if (Snapshots.Num() > 1)
 	{
-		for (int32 i = 0; i < Snapshots.Num(); ++i)
+		for (int32 i = 1; i < Snapshots.Num(); ++i)
 		{
 			const FMotionSnapshot& Snapshot = Snapshots[i];
 			const float Delay = Snapshot.ArrivalTime - Snapshot.Timestamp;

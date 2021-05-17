@@ -69,6 +69,7 @@ struct TStructOpsTypeTraits<FMotionSnapshot> : public TStructOpsTypeTraitsBase2<
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMotionInterpolatorDelegate, const FMotionSnapshot&, Snapshot);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FMotionInterpolatorErrorDelegate);
 DECLARE_DELEGATE(FAdditionalDelayDelegate);
 
 UCLASS( ClassGroup=(Custom), meta=(BlueprintSpawnableComponent) )
@@ -121,6 +122,8 @@ public:
 
 	UPROPERTY(BlueprintAssignable, Category = "MotionInterpolator")
 	FMotionInterpolatorDelegate OnSnapshotAdded;
+	UPROPERTY(BlueprintAssignable, Category = "MotionInterpolator")
+	FMotionInterpolatorErrorDelegate OnNotEnoughData;
 
 	UPROPERTY(EditAnywhere, Category = "MotionInterpolator")
 	bool UseExtrapolation = false;
