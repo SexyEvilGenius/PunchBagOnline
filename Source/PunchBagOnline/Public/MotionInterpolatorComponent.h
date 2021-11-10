@@ -112,6 +112,8 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "MotionInterpolator")
 	void EnableTempHighFreqUpdate();
+	UFUNCTION(BlueprintCallable, Category = "MotionInterpolator")
+	void SetHighFreqUpdateEnabled(bool Enabled);
 
 	UFUNCTION(BlueprintCallable, Category = "MotionInterpolator")
 	void OvertakeMovementAuthority(float Duration);

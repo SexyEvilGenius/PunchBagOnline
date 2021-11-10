@@ -133,9 +133,9 @@ void UMotionInterpolatorComponent::TickComponent(float DeltaTime, ELevelTick Tic
 		if (hasMovementAuthority)
 		{
 			float syncPeriod = SyncPeriod;
-			if (CurrentHightFreqSyncDuration > KINDA_SMALL_NUMBER)
+			if (CurrentHightFreqSyncDuration > KINDA_SMALL_NUMBER || CurrentHightFreqSyncDuration == -1.0f)
 			{
-				CurrentHightFreqSyncDuration -= DeltaTime;
+				CurrentHightFreqSyncDuration = FMath::Max(CurrentHightFreqSyncDuration-DeltaTime, 0.0f);
 				syncPeriod = HighFreqSyncPeriod;
 			}
 			if ((syncPeriod < KINDA_SMALL_NUMBER || (currentSyncedTime - LastSyncTime) > syncPeriod))
@@ -319,6 +319,11 @@ void UMotionInterpolatorComponent::ServerReleaseOwnership_Implementation(const F
 void UMotionInterpolatorComponent::EnableTempHighFreqUpdate()
 {
 	CurrentHightFreqSyncDuration = HighFreqSyncDuration;
+}
+
+void UMotionInterpolatorComponent::SetHighFreqUpdateEnabled(bool Enabled)
+{
+	CurrentHightFreqSyncDuration = Enabled ? -1.0f : 0.0f;
 }
 
 void UMotionInterpolatorComponent::ClientReleaseOwnership_Implementation()
